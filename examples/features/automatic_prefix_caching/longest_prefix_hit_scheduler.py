@@ -13,6 +13,7 @@ Use ``LongestPrefixHitSyncScheduler`` together with
 ``--no-async-scheduling`` for synchronous scheduling.
 """
 
+import os
 from typing import TypeVar
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
@@ -21,6 +22,7 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
 _SchedulerT = TypeVar("_SchedulerT", bound=Scheduler)
+_DECODE_RESERVE_ENV = "VLLM_LONGEST_PREFIX_DECODE_RESERVE_TOKENS"
 
 
 class _LongestPrefixHitMixin:
@@ -38,6 +40,20 @@ class _LongestPrefixHitMixin:
             raise ValueError(
                 "Longest-prefix-hit-first scheduling requires --enable-prefix-caching."
             )
+        self._base_watermark_blocks = self.kv_cache_manager.watermark_blocks
+        self._decode_reserve_tokens = int(os.getenv(_DECODE_RESERVE_ENV, "0"))
+        if self._decode_reserve_tokens < 0:
+            raise ValueError(f"{_DECODE_RESERVE_ENV} must be non-negative.")
+
+    def _update_decode_reserve(self: _SchedulerT) -> None:
+        """Reserve decode growth headroom when admitting a waiting request."""
+        reserve_blocks_per_request = (
+            self._decode_reserve_tokens + self.block_size - 1
+        ) // self.block_size
+        self.kv_cache_manager.watermark_blocks = (
+            self._base_watermark_blocks
+            + reserve_blocks_per_request * (len(self.running) + 1)
+        )
 
     def _get_prefix_hit_tokens(self: _SchedulerT, request: Request) -> int:
         if (
@@ -60,10 +76,12 @@ class _LongestPrefixHitMixin:
     ) -> RequestQueue | None:
         # Preserve the base scheduler's blocked-request promotion semantics.
         if self.skipped_waiting:
+            self._update_decode_reserve()
             return self.skipped_waiting
         if not self.waiting:
             return None
 
+        self._update_decode_reserve()
         request = min(
             self.waiting,
             key=lambda req: (
