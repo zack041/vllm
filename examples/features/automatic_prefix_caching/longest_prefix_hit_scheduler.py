@@ -9,20 +9,29 @@ Run the async variant, which matches vLLM's default scheduling mode:
         --enable-prefix-caching \
         --scheduler-cls longest_prefix_hit_scheduler.LongestPrefixHitScheduler
 
+Set ``VLLM_LONGEST_PREFIX_BUFFER_PERCENT`` to tune the stale-prefix-cache
+buffer for waiting-request admission. It defaults to 5% of vLLM's usable KV
+block pool. Existing running requests can still decode into this buffer.
+
+This experiment intentionally does not bypass the buffer for oversized idle
+admissions. If a request's known sequence cannot fit within the non-buffered
+KV pool, lower the buffer percentage or disable it.
+
 Use ``LongestPrefixHitSyncScheduler`` together with
 ``--no-async-scheduling`` for synchronous scheduling.
 """
 
+import math
 import os
 from typing import TypeVar
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import RequestQueue, SchedulingPolicy
 from vllm.v1.core.sched.scheduler import Scheduler
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 _SchedulerT = TypeVar("_SchedulerT", bound=Scheduler)
-_DECODE_RESERVE_ENV = "VLLM_LONGEST_PREFIX_DECODE_RESERVE_TOKENS"
+_PREFIX_BUFFER_PERCENT_ENV = "VLLM_LONGEST_PREFIX_BUFFER_PERCENT"
 
 
 class _LongestPrefixHitMixin:
@@ -41,18 +50,29 @@ class _LongestPrefixHitMixin:
                 "Longest-prefix-hit-first scheduling requires --enable-prefix-caching."
             )
         self._base_watermark_blocks = self.kv_cache_manager.watermark_blocks
-        self._decode_reserve_tokens = int(os.getenv(_DECODE_RESERVE_ENV, "0"))
-        if self._decode_reserve_tokens < 0:
-            raise ValueError(f"{_DECODE_RESERVE_ENV} must be non-negative.")
+        self._prefix_buffer_percent = float(os.getenv(_PREFIX_BUFFER_PERCENT_ENV, "5"))
+        if not 0 <= self._prefix_buffer_percent <= 100:
+            raise ValueError(f"{_PREFIX_BUFFER_PERCENT_ENV} must be between 0 and 100.")
+        self._install_waiting_buffer_admission_gate()
 
-    def _update_decode_reserve(self: _SchedulerT) -> None:
-        """Reserve decode growth headroom when admitting a waiting request."""
-        reserve_blocks_per_request = (
-            self._decode_reserve_tokens + self.block_size - 1
-        ) // self.block_size
+    def _install_waiting_buffer_admission_gate(self: _SchedulerT) -> None:
+        allocate_slots = self.kv_cache_manager.allocate_slots
+
+        def allocate_slots_with_waiting_buffer(request: Request, *args, **kwargs):
+            if request.status in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+                kwargs["has_scheduled_reqs"] = True
+            return allocate_slots(request, *args, **kwargs)
+
+        self.kv_cache_manager.allocate_slots = allocate_slots_with_waiting_buffer
+
+    def _update_waiting_admission_watermark(self: _SchedulerT) -> None:
+        """Protect stale prefix-cache blocks when admitting waiting requests."""
+        usable_pool_blocks = max(self.kv_cache_manager.block_pool.num_gpu_blocks - 1, 0)
+        prefix_buffer_blocks = math.ceil(
+            usable_pool_blocks * self._prefix_buffer_percent / 100
+        )
         self.kv_cache_manager.watermark_blocks = (
-            self._base_watermark_blocks
-            + reserve_blocks_per_request * (len(self.running) + 1)
+            self._base_watermark_blocks + prefix_buffer_blocks
         )
 
     def _get_prefix_hit_tokens(self: _SchedulerT, request: Request) -> int:
@@ -76,12 +96,12 @@ class _LongestPrefixHitMixin:
     ) -> RequestQueue | None:
         # Preserve the base scheduler's blocked-request promotion semantics.
         if self.skipped_waiting:
-            self._update_decode_reserve()
+            self._update_waiting_admission_watermark()
             return self.skipped_waiting
         if not self.waiting:
             return None
 
-        self._update_decode_reserve()
+        self._update_waiting_admission_watermark()
         request = min(
             self.waiting,
             key=lambda req: (
